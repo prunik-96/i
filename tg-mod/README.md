@@ -19,21 +19,30 @@
 
 Команды пишешь сам в любом чате: мод заменит твоё сообщение ответом.
 
-## Установка
+## Установка на ПК
 
-1. Получи `api_id` и `api_hash` на https://my.telegram.org → **API development tools**.
-2. Установи Python 3.9+ и зависимости:
-   ```bash
-   cd tg-mod
-   pip install -r requirements.txt
-   ```
-   **Termux (Android):** `pkg install python git && pip install telethon`
-3. Запусти:
-   ```bash
-   python main.py
-   ```
-   При первом запуске он спросит `api_id`, `api_hash`, номер телефона и код из Telegram
-   (и пароль 2FA, если он включён). Дальше вход сохраняется в `data/session.session`.
+### Windows
+1. Установи Python с https://www.python.org/downloads/ и при установке **обязательно поставь галочку
+   «Add python.exe to PATH»**.
+2. Получи `api_id` и `api_hash` на https://my.telegram.org → **API development tools**.
+3. Скачай папку `tg-mod` и дважды кликни **`start.bat`**.
+   При первом запуске он сам всё установит, потом спросит `api_id`, `api_hash`, номер телефона и код
+   из Telegram (и пароль 2FA, если включён). Дальше вход запоминается.
+4. Окно не закрывай: пока оно открыто, мод работает. Если мод упадёт, он сам перезапустится через 10 секунд.
+
+**Автозапуск вместе с Windows:** нажми `Win + R`, введи `shell:startup` и нажми Enter. В открывшуюся
+папку положи ярлык на `start.bat` (ПКМ по файлу → «Создать ярлык» → перетащи ярлык туда).
+
+### Linux / macOS
+```bash
+cd tg-mod
+./start.sh
+```
+
+### Termux (Android)
+`pkg install python` и потом `pip install telethon && python main.py`
+
+Лог работы пишется в `data/mod.log`.
 
 ## Настройки (`config.json`)
 

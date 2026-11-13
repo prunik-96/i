@@ -438,7 +438,14 @@ async def main():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(DATA_DIR / "mod.log", encoding="utf-8"),
+        ],
+    )
     logging.getLogger("telethon").setLevel(logging.WARNING)
     try:
         client.loop.run_until_complete(main())

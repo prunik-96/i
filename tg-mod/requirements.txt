@@ -1,2 +1,1 @@
 telethon>=1.36
-cryptg; platform_system != "Android"
