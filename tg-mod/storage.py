@@ -1,5 +1,6 @@
 """SQLite-кэш сообщений: нужен, чтобы показать текст и медиа после удаления."""
 import os
+import re
 import sqlite3
 import time
 
@@ -19,6 +20,8 @@ CREATE TABLE IF NOT EXISTS messages (
     media_path  TEXT,
     ttl         INTEGER,            -- таймер самоуничтожения (сек)
     deleted_at  INTEGER,
+    topic_id    INTEGER,            -- ID темы в группе-форуме
+    topic_title TEXT,
     PRIMARY KEY (chat_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_msg ON messages (msg_id);
@@ -37,7 +40,22 @@ CREATE INDEX IF NOT EXISTS idx_edits_msg ON edits (chat_id, msg_id);
 COLUMNS = (
     "chat_id", "msg_id", "kind", "is_channel", "chat_title", "sender_id",
     "sender_name", "out", "text", "date", "media_kind", "media_path", "ttl",
+    "topic_id", "topic_title",
 )
+
+# Колонки, добавленные после первой версии: старые базы дополняются автоматически.
+MIGRATIONS = {"topic_id": "INTEGER", "topic_title": "TEXT"}
+
+
+def normalize(text):
+    """Для поиска: регистр не важен, «ё» = «е»."""
+    return (text or "").lower().replace("ё", "е")
+
+
+def fts_query(query):
+    """Превращает «привет мир» в запрос FTS5: оба слова, поиск по началу слова."""
+    words = re.findall(r"\w+", normalize(query))
+    return " AND ".join(f'"{w}"*' for w in words)
 
 
 class Store:
@@ -45,15 +63,82 @@ class Store:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        existing = {r["name"] for r in self.db.execute("PRAGMA table_info(messages)")}
+        for col, typ in MIGRATIONS.items():
+            if col not in existing:
+                self.db.execute(f"ALTER TABLE messages ADD COLUMN {col} {typ}")
+        self._init_fts()
         self.db.commit()
 
+    def close(self):
+        self.db.close()
+
+    # ------------------------------------------------------------ поиск ----
+    def _init_fts(self):
+        try:
+            exists = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'"
+            ).fetchone()
+            self.db.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5("
+                "body, tokenize = 'unicode61 remove_diacritics 2')"
+            )
+            self.fts = True
+        except sqlite3.OperationalError:
+            self.fts = False  # SQLite без FTS5: будет медленный поиск через LIKE
+            return
+        if not exists:  # первый запуск новой версии: индексируем то, что уже есть
+            rows = self.db.execute("SELECT rowid, text FROM messages WHERE text != ''").fetchall()
+            self.db.executemany(
+                "INSERT INTO messages_fts (rowid, body) VALUES (?, ?)",
+                [(r["rowid"], normalize(r["text"])) for r in rows],
+            )
+
+    def _fts_set(self, rowid, text):
+        if not self.fts:
+            return
+        self.db.execute("DELETE FROM messages_fts WHERE rowid = ?", (rowid,))
+        if text:
+            self.db.execute(
+                "INSERT INTO messages_fts (rowid, body) VALUES (?, ?)", (rowid, normalize(text))
+            )
+
+    def search(self, query, chat_id=None, deleted_only=False, limit=20):
+        filters, params = [], []
+        if chat_id is not None:
+            filters.append("m.chat_id = ?")
+            params.append(chat_id)
+        if deleted_only:
+            filters.append("m.deleted_at IS NOT NULL")
+        extra = "".join(f" AND {f}" for f in filters)
+
+        if self.fts:
+            match = fts_query(query)
+            if not match:
+                return []
+            sql = (
+                "SELECT m.* FROM messages_fts f JOIN messages m ON m.rowid = f.rowid "
+                f"WHERE messages_fts MATCH ?{extra} ORDER BY m.date DESC LIMIT ?"
+            )
+            return self.db.execute(sql, [match, *params, limit]).fetchall()
+
+        words = re.findall(r"\w+", query)
+        if not words:
+            return []
+        likes = " AND ".join("m.text LIKE ?" for _ in words)
+        sql = f"SELECT m.* FROM messages m WHERE {likes}{extra} ORDER BY m.date DESC LIMIT ?"
+        return self.db.execute(sql, [*(f"%{w}%" for w in words), *params, limit]).fetchall()
+
+    # -------------------------------------------------------- сообщения ----
     def save(self, **row):
         values = [row.get(c) for c in COLUMNS]
-        self.db.execute(
+        cur = self.db.execute(
             f"INSERT OR IGNORE INTO messages ({', '.join(COLUMNS)}) "
             f"VALUES ({', '.join('?' * len(COLUMNS))})",
             values,
         )
+        if cur.rowcount:
+            self._fts_set(cur.lastrowid, row.get("text"))
         self.db.commit()
 
     def set_media_path(self, chat_id, msg_id, path):
@@ -65,8 +150,16 @@ class Store:
 
     def get(self, chat_id, msg_id):
         return self.db.execute(
-            "SELECT * FROM messages WHERE chat_id = ? AND msg_id = ?", (chat_id, msg_id)
+            "SELECT rowid, * FROM messages WHERE chat_id = ? AND msg_id = ?", (chat_id, msg_id)
         ).fetchone()
+
+    def chat_title(self, chat_id):
+        row = self.db.execute(
+            "SELECT chat_title FROM messages WHERE chat_id = ? AND chat_title != '' "
+            "ORDER BY date DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        return row["chat_title"] if row else None
 
     def mark_deleted(self, chat_id, msg_ids):
         """Помечает сообщения удалёнными и возвращает те, что были в кэше.
@@ -96,7 +189,7 @@ class Store:
         return rows
 
     def record_edit(self, chat_id, msg_id, new_text):
-        """Сохраняет старую версию текста. Возвращает (старая строка, старый текст) или None."""
+        """Сохраняет старую версию текста. Возвращает старую строку или None."""
         row = self.get(chat_id, msg_id)
         if row is None or (row["text"] or "") == (new_text or ""):
             return None
@@ -108,6 +201,7 @@ class Store:
             "UPDATE messages SET text = ? WHERE chat_id = ? AND msg_id = ?",
             (new_text, chat_id, msg_id),
         )
+        self._fts_set(row["rowid"], new_text)
         self.db.commit()
         return row
 
@@ -137,7 +231,8 @@ class Store:
         """Удаляет старые НЕудалённые сообщения (удалённые храним всегда)."""
         cutoff = int(time.time()) - keep_days * 86400
         old = self.db.execute(
-            "SELECT chat_id, msg_id, media_path FROM messages WHERE deleted_at IS NULL AND date < ?",
+            "SELECT rowid, chat_id, msg_id, media_path FROM messages "
+            "WHERE deleted_at IS NULL AND date < ?",
             (cutoff,),
         ).fetchall()
         for r in old:
@@ -146,6 +241,10 @@ class Store:
                     os.remove(r["media_path"])
                 except OSError:
                     pass
+        if self.fts:
+            self.db.executemany(
+                "DELETE FROM messages_fts WHERE rowid = ?", [(r["rowid"],) for r in old]
+            )
         self.db.executemany(
             "DELETE FROM messages WHERE chat_id = ? AND msg_id = ?",
             [(r["chat_id"], r["msg_id"]) for r in old],
